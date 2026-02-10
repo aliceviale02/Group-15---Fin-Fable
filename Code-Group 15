@@ -1,0 +1,259 @@
+#include <Servo.h>
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+#include <Adafruit_NeoPixel.h>
+
+Servo myServo;
+const int servoPin = 3;
+
+#define LED_PIN    6     
+#define LED_COUNT  2     
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+const int fsrPin = A1;   
+const int ldrPin = A2;  
+const int buttonPin = 2; 
+const int IR_PIN = 12;
+
+//Display and Shift Register
+const int latchPin = 7;  
+const int clockPin = 4;  
+const int dataPin  = 8;  
+const int digitPins[] = {A0, A3, A4, A5}; 
+
+// Binary codes to turn on segments for numbers 0-9
+byte numCodes[] = {
+  0b11111100, 0b01100000, 0b11011010, 0b11110010, 0b01100110, 
+  0b10110110, 0b10111110, 0b11100000, 0b11111110, 0b11110110
+};
+
+SoftwareSerial mySoftwareSerial(9, 10);
+DFRobotDFPlayerMini myDFPlayer;
+
+int hur = 17, mint = 0, sec = 0; // Initial time (17:00:00)
+int alarmHur = -1, alarmMint = -1; // Alarm time (-1 means disabled)
+unsigned long previousMillis = 0;
+unsigned long lastIRCheck = 0;
+unsigned long lastSensorRead = 0;
+
+bool isAlarmPlaying = false;
+bool lightIsOn = false;
+bool lastStateIR = false;
+int ledMode = 4; // Initial color yellow
+
+int ldrReading = 0;
+int ledBrightness = 0;
+
+bool isPspotActive = false;
+unsigned long pspotStartTime = 0;
+const int pspotDuration = 1000; 
+int fsrThreshold = 500;
+
+// Debounce button
+int lastButtonState = HIGH;
+int buttonState;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
+
+void setup() {
+  myServo.attach(servoPin, 500, 2500);
+  myServo.write(0); 
+  
+  pinMode(buttonPin, INPUT_PULLUP);
+  pinMode(IR_PIN, INPUT);
+  
+  strip.begin();           
+  strip.show(); // Turn off all LEDs at startup
+  strip.setBrightness(100); 
+
+  pinMode(latchPin, OUTPUT); pinMode(clockPin, OUTPUT); pinMode(dataPin, OUTPUT);
+  for (int i = 0; i < 4; i++) {
+    pinMode(digitPins[i], OUTPUT);
+    digitalWrite(digitPins[i], HIGH);
+  }
+  
+  Serial.begin(9600); 
+  mySoftwareSerial.begin(9600);
+  
+  if (!myDFPlayer.begin(mySoftwareSerial)) { // Error message if MP3 module fails
+    Serial.println("DFPlayer Error");
+  }
+  myDFPlayer.volume(25);
+  
+  Serial.println("SYSTEM READY");
+}
+
+void loop() {
+  refreshDisplay(); // Handle display multiplexing (always active)
+
+// Check IR sensor every 50ms
+  if (millis() - lastIRCheck >= 50) {
+    controlSensorIR();
+    lastIRCheck = millis();
+  }
+
+ // Read commands from the Serial Monitor (PC)
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    String inputLower = input;
+    inputLower.toLowerCase(); 
+
+    if (inputLower.startsWith("sync")) { // Sync time: "sync 12:30"
+      int spaceIndex = input.indexOf(' ');
+      if (spaceIndex != -1) {
+        String t = input.substring(spaceIndex + 1);
+        hur = t.substring(0, 2).toInt(); mint = t.substring(3, 5).toInt(); sec = 0;
+      }
+    }
+    else if (inputLower.startsWith("set_alarm")) { // Set alarm: "set_alarm 07:00"
+      int spaceIndex = input.indexOf(' ');
+      if (spaceIndex != -1) {
+        String t = input.substring(spaceIndex + 1);
+        alarmHur = t.substring(0, 2).toInt(); alarmMint = t.substring(3, 5).toInt();
+      }
+    }
+    else if (inputLower == "play_3") { myDFPlayer.play(3); }
+    else if (inputLower == "stop" || inputLower == "s")  { stopAlarm(); } 
+    else if (inputLower == "alarm" || inputLower == "a") { startAlarm(); } 
+    else if (inputLower == "light_on" || inputLower == "on") { lightIsOn = true; ledMode = 4; }
+    else if (inputLower == "light_off" || inputLower == "off") { lightIsOn = false; }
+    else if (inputLower == "blue")   { ledMode = 0; lightIsOn = true; }
+    else if (inputLower == "red")    { ledMode = 1; lightIsOn = true; }
+    else if (inputLower == "green")  { ledMode = 2; lightIsOn = true; }
+    else if (inputLower == "white")  { ledMode = 3; lightIsOn = true; }
+    else if (inputLower == "yellow") { ledMode = 4; lightIsOn = true; }
+  }
+
+// Read LDR (light) and FSR (pressure) sensors every 100ms
+  if (millis() - lastSensorRead > 100) {
+    int fsrReading = analogRead(fsrPin);
+    ldrReading = analogRead(ldrPin);
+    
+    // Adjust LED brightness based on room light level
+    ledBrightness = map(ldrReading, 0, 1023, 255, 10);
+    ledBrightness = constrain(ledBrightness, 10, 255);
+    strip.setBrightness(ledBrightness);
+
+    // If pressure sensor is touched, trigger the fin
+    if (fsrReading > fsrThreshold && !isPspotActive) {
+      isPspotActive = true;
+      pspotStartTime = millis();
+      Serial.println("pspot"); 
+    }
+    
+    handleButtonAndLeds();
+    lastSensorRead = millis();
+  }
+
+  // Fin animation logic (Servo)
+  if (isPspotActive) {
+    if (millis() - pspotStartTime < pspotDuration) {
+      if (((millis() - pspotStartTime) / 90) % 2 == 0) { myServo.write(50); } 
+      else { myServo.write(0); }
+    } else {
+      isPspotActive = false;
+      myServo.write(0); 
+      Serial.println("fish_normal");
+    }
+  }
+
+  // Clock progression (every second)
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= 1000) {
+    previousMillis = currentMillis;
+    sec++;
+    if (sec >= 60) { sec = 0; mint++; }
+    if (mint >= 60) { mint = 0; hur++; }
+    if (hur >= 24) hur = 0;
+
+  // Check if it's alarm time
+    if (hur == alarmHur && mint == alarmMint && sec == 0 && !isAlarmPlaying) {
+      startAlarm();
+    }
+  }
+}
+
+// SUPPORT FUNCTIONS
+
+// Updates the 4-digit display via multiplexing
+void refreshDisplay() {
+  int digits[4] = {hur/10, hur%10, mint/10, mint%10};
+  // Turn off all digits to prevent "ghosting"
+  for (int i = 0; i < 4; i++) {
+    for (int k = 0; k < 4; k++) digitalWrite(digitPins[k], HIGH);
+    byte segs = numCodes[digits[i]];
+    if (i == 1 && sec % 2 == 0) segs |= 0b00000001; // Blink the colon (dot) every second
+    digitalWrite(latchPin, LOW);
+    shiftOut(dataPin, clockPin, LSBFIRST, segs); 
+    digitalWrite(latchPin, HIGH);
+    digitalWrite(digitPins[i], LOW); 
+    delayMicroseconds(1500); // Short delay for Persistence of Vision
+    digitalWrite(digitPins[i], HIGH);
+  }
+}
+
+// Check if the fin/part is inserted or removed via IR sensor
+void controlSensorIR() {
+  bool stateAttual = digitalRead(IR_PIN);
+  if (stateAttual == LOW && lastStateIR == false) {
+    Serial.println("Fin_inserted");
+    lastStateIR = true;
+  }
+  if (stateAttual == HIGH && lastStateIR == true) {
+    Serial.println("Fin_removed");
+    lastStateIR = false;
+  }
+}
+
+void startAlarm() {
+  if (!isAlarmPlaying) {
+    isAlarmPlaying = true;
+    myDFPlayer.play(7); // Plays file 0007.mp3 from the SD card
+    Serial.println("alarm_started");
+  }
+}
+
+void stopAlarm() {
+  isAlarmPlaying = false;
+  myDFPlayer.stop(); // Disable alarm after stopping it
+  alarmHur = -1; 
+  Serial.println("alarm_stopped");
+}
+
+void toggleLight() {
+  lightIsOn = !lightIsOn;
+  if (lightIsOn) { ledMode = 4; Serial.println("light_on"); } 
+  else { Serial.println("light_off"); }
+}
+
+// Handles NeoPixel colors and physical button debounce logic
+void handleButtonAndLeds() {
+  int reading = digitalRead(buttonPin);
+  if (reading != lastButtonState) lastDebounceTime = millis();
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (reading != buttonState) {
+      buttonState = reading;
+      if (buttonState == LOW) toggleLight();
+    }
+  }
+  lastButtonState = reading;
+
+  uint32_t color;
+  if (isAlarmPlaying) {
+    color = ((millis() / 500) % 2 == 0) ? strip.Color(255, 0, 0) : strip.Color(0, 0, 0); // Blink Red if the alarm is ringing
+  } else if (!lightIsOn) {
+    color = strip.Color(0, 0, 0);
+  } else {
+    switch (ledMode) { // Select color based on ledMode
+      case 0: color = strip.Color(0, 0, 255); break;
+      case 1: color = strip.Color(255, 0, 0); break;
+      case 2: color = strip.Color(0, 255, 0); break;
+      case 3: color = strip.Color(255, 255, 255); break;
+      case 4: color = strip.Color(255, 180, 0); break; 
+      default: color = strip.Color(0, 0, 0); break;
+    }
+  }
+  for(int i=0; i<LED_COUNT; i++) strip.setPixelColor(i, color);
+  strip.show();
+}
